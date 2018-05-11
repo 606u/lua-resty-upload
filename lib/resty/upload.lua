@@ -256,6 +256,153 @@ local function read_preamble(self)
 end
 
 
+function _M.delfiles(form)
+    local k, v;
+    for k,v in pairs(form) do
+	if (v.path) then
+	    os.remove(v.path);
+	end
+    end
+    return nil;
+end
+
+
+-- returns a table with multipart/form-data fields
+-- opts = {
+--   timeout_ms = 1000,
+--   files = { "field-name" = "Content-Type regex" },
+--   get_filename = function(opts, field_name, file_name, content_type)
+-- }
+-- local form, err = upload:parse(opts);
+-- ...
+-- form:release();
+function _M.parse(opts)
+    local form, err = _M:new(chunk_size);
+    if (not form) then
+	return nil, err;
+    end
+
+    -- default options
+    opts = opts or {};
+    opts.timeout_ms = opts.timeout_ms or 1000;
+    opts.upload_dir = opts.upload_dir or "/tmp/";
+    -- opts.files is optional
+    opts.get_filename = opts.get_filename or os.tmpname;
+
+    form:set_timeout(opts.timeout_ms);
+
+    local rv = {};
+    setmetatable({ release = del_temp_files }, rv);
+    local field_name = nil; -- filled when typ == "header"
+    -- either field_name or file is used
+    local field_value = nil;
+    local file = nil;
+    while (true) do
+        local typ, res, err = form:read();
+        if (not typ) then
+            return _M.delfiles(rv), err;
+        end
+
+	if (typ == "header") then
+	    local k, v = res[1], res[2];
+	    if (k == "Content-Disposition") then
+	        -- expecting 'form-data; name="<name>"[; filename="<fn.ext>"'
+		if (string.sub(v, 1, 9) ~= "form-data") then
+		    return _M.delfiles(rv), "Content-Disposition not starting with form-data";
+		end
+		local name = string.match(v, " name=\"([^\"]+)\"");
+		if (not name) then
+		    return _M.delfiles(rv), "Content-Disposition lacking field name";
+		end
+		if (field_name) then
+		    return _M.delfiles(rv), "Still in field '" .. field_name .. "', but '" .. name .. "' just started";
+		end
+		field_name = name;
+
+		-- test for a file upload
+		name = string.match(v, " filename=\"([^\"]*)\""); -- " in name?
+		if (type(name) == "nil") then
+		    field_value = "";
+		else
+		    file = { name = name, size = 0 };
+		end
+
+	    elseif (k == "Content-Type") then
+		-- expecting 'text/plain', 'image/jpeg', etc...
+		if (not field_name) then
+		    return _M.delfiles(rv), "got Content-Type without Content-Disposition";
+		end
+		if (string.find(v, "/", 1, true) == nil) then
+		    return _M.delfiles(rv), "unexpected Content-Type '" .. v .. "'";
+		end
+		if (not file) then
+		    return _M.delfiles(rv), "got Content-Type for a form field";
+		end
+		if (opts.files) then
+		    local re = opts.files[field_name];
+		    if (not re) then
+			return _M.delfiles(rv), "file '" .. field_name .. "' were unexpected";
+		    end
+		    if (not string.match(v, re)) then
+			return _M.delfiles(rv), "Content-Type '" .. v .. "' for '" .. field_name .. "' does not match to '" .. re .. "'";
+		    end
+		end
+		file.type = v;
+		file.path = opts.get_filename(opts, field_name, file.name, v);
+		file.fd = io.open(file.path, "w+");
+		if (not file.fd) then
+		    return _M.delfiles(rv), "failed to create file '" .. file.path .. "'";
+		end
+	    end
+
+	elseif (typ == "body") then
+	    if (not file and not field_value) then
+		return _M.delfiles(rv), "got body without header";
+	    end
+	    if (file) then
+		file.fd:write(res);
+		file.size = file.size + string.len(res);
+	    else -- a form field
+		field_value = field_value .. res;
+	    end
+
+	elseif (typ == "part_end") then
+	    if (not field_name) then
+		return _M.delfiles(rv), "got part_end without header";
+	    end
+	    local v;
+	    if (file) then
+		file.fd:close();
+		file.fd = nil;
+		v = file;
+	    else -- a form field
+		v = field_value;
+	    end
+	    local x = rv[field_name];
+	    if (not x) then
+		rv[field_name] = v;
+	    elseif (type(x) == "table") then
+		table.insert(x, v);
+	    else
+		rv[field_name] = { x, v };
+	    end
+	    field_name = nil;
+	    field_value = nil;
+	    file = nil;
+
+	elseif (typ == "eof") then
+	    if (field_name) then
+		return _M.delfiles(rv), "got eof without last part_end";
+	    end
+	    return rv, false;
+
+	else
+	    return nil, "bad type '" .. typ .. "' returned";
+        end
+    end
+end
+
+
 state_handlers = {
     read_preamble,
     read_header,
